@@ -63,8 +63,8 @@ BatteryInfo GetBatteryInfo() {
           .isOk();  // should not have transport error
     }
 
-    LOG(INFO) << "charge_status " << toString(charge_status) << ", charging " << charging
-              << ", status " << toString(res) << ", capacity " << capacity;
+    //LOG(INFO) << "charge_status " << toString(charge_status) << ", charging " << charging
+    //          << ", status " << toString(res) << ", capacity " << capacity;
 
     constexpr int BATTERY_READ_TIMEOUT_IN_SEC = 10;
     // At startup, the battery drivers in devices like N5X/N6P take some time to load

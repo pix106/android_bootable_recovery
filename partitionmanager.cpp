@@ -330,6 +330,13 @@ int TWPartitionManager::Process_Fstab(string Fstab_Filename, bool Display_Error,
 	}
 	TWPartition *data = NULL;
 	TWPartition *meta = NULL;
+	// Set once /data or /metadata has been taken from the ROM's fstab. Only the
+	// entry from the recovery fstab must be replaced; further lines for the same
+	// mount point in the ROM's fstab (e.g. one for f2fs and one for ext4) have to
+	// reach Process_Fstab_Line() so they are stored as alternative per-filesystem
+	// mount flags instead of replacing each other.
+	bool data_from_rom = false;
+	bool meta_from_rom = false;
 #ifndef TW_SKIP_ADDITIONAL_FSTAB
 parse:
 #endif
@@ -349,13 +356,13 @@ parse:
 
 		if (parse_userdata) {
 			if (strstr(fstab_line, "/metadata") && !strstr(fstab_line, "/data")) {
-				if (meta) {
+				if (meta && !meta_from_rom) {
 					Partitions.erase(std::find(Partitions.begin(), Partitions.end(), meta));
 					delete meta;
 					meta = NULL;
 				}
 			} else if (strstr(fstab_line, "/data")) {
-				if (data) {
+				if (data && !data_from_rom) {
 					Partitions.erase(std::find(Partitions.begin(), Partitions.end(), data));
 					delete data;
 					data = NULL;
@@ -372,8 +379,14 @@ parse:
 
 		TWPartition* partition = new TWPartition();
 		if (partition->Process_Fstab_Line(fstab_line, Display_Error, parse_userdata ? NULL : &twrp_flags)) {
-			if (partition->Mount_Point == "/data") data = partition;
-			if (partition->Mount_Point == "/metadata") meta = partition;
+			if (partition->Mount_Point == "/data") {
+				data = partition;
+				data_from_rom = parse_userdata;
+			}
+			if (partition->Mount_Point == "/metadata") {
+				meta = partition;
+				meta_from_rom = parse_userdata;
+			}
 			if (partition->Is_Super && !Prepare_Super_Volume(partition)) {
 				goto clear;
 			}

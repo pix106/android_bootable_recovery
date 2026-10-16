@@ -32,6 +32,8 @@
 #include <libgen.h>
 #include <zlib.h>
 #include <sstream>
+#include <algorithm>
+#include <vector>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
 #include <libsnapshot/snapshot.h>
@@ -253,6 +255,7 @@ TWPartition::TWPartition() {
 	Is_Encrypted = false;
 	Is_Decrypted = false;
 	Is_FBE = false;
+	Needs_Inline_Crypt = false;
 	Mount_To_Decrypt = false;
 	Decrypted_Block_Device = "";
 	Display_Name = "";
@@ -958,6 +961,13 @@ void TWPartition::Apply_TW_Flag(const unsigned flag, const char* str, const bool
 			// fileencryption=ice:aes-256-heh
 			{
 				std::string FBE = str;
+				// *_optimized and wrapped-key policies are only usable through the inline crypto
+				// engine, so make sure /data is mounted with 'inlinecrypt' for them. Legacy
+				// 'fileencryption=ice' is left alone: the ROM mounts it without inlinecrypt.
+				if (FBE.find("inlinecrypt") != std::string::npos ||
+					FBE.find("emmc_optimized") != std::string::npos ||
+					FBE.find("wrappedkey") != std::string::npos)
+					Needs_Inline_Crypt = true;
 				size_t colon_loc = FBE.find(":");
 				if (colon_loc == std::string::npos) {
 					property_set("fbe.contents", FBE.c_str());
@@ -994,7 +1004,8 @@ void TWPartition::Apply_TW_Flag(const unsigned flag, const char* str, const bool
 			}
 			break;
 		case TWFLAG_WRAPPEDKEY:
-			// no more processing needed. leaving it here in case we want to do something in the future
+			// Hardware-wrapped keys can only be programmed into the inline crypto engine
+			Needs_Inline_Crypt = true;
 			break;
 		case TWFLAG_FLASHIMG:
 			Can_Flash_Img = val;
@@ -1583,6 +1594,66 @@ bool TWPartition::Is_File_System_Writable(void) {
 	return (access(test_path.c_str(), W_OK) == 0);
 }
 
+static bool Has_Mount_Option(const string& options, const string& opt) {
+	std::vector<string> parts = TWFunc::Split_String(options, ",");
+	return std::find(parts.begin(), parts.end(), opt) != parts.end();
+}
+
+static string Remove_Mount_Option(const string& options, const string& opt) {
+	string res;
+	for (const string& part : TWFunc::Split_String(options, ",")) {
+		if (part.empty() || part == opt)
+			continue;
+		if (!res.empty())
+			res += ",";
+		res += part;
+	}
+	return res;
+}
+
+int TWPartition::Mount_With_Fallback(const string& mount_fs, unsigned long flags) {
+	string options = Mount_Options;
+
+	// FBE on msm-4.19+ needs the inline crypto engine to be enabled at mount time.
+	// Older recovery fstabs (written for the 4.4 kernel, where ICE was driven by PFK and
+	// no mount option was needed) don't carry it, so add it for /data when the policy needs it.
+	if (Mount_Point == "/data" && Needs_Inline_Crypt && (mount_fs == "ext4" || mount_fs == "f2fs") &&
+		!Has_Mount_Option(options, "inlinecrypt")) {
+		options += options.empty() ? "inlinecrypt" : ",inlinecrypt";
+	}
+
+	// Build the list of option strings to try. The old code fell straight back to mounting with
+	// no options at all, which silently threw away 'inlinecrypt' whenever any other option was
+	// rejected by the kernel -> the FBE keys can't be used and decryption fails on 4.19.
+	std::vector<string> attempts;
+	attempts.push_back(options);
+	if (Has_Mount_Option(options, "inlinecrypt")) {
+		attempts.push_back("inlinecrypt");                             // keep ICE, drop the rest
+		attempts.push_back(Remove_Mount_Option(options, "inlinecrypt")); // kernel without blk-crypto (e.g. 4.4)
+	}
+	attempts.push_back("");
+
+	std::vector<string> tried;
+	for (const string& opts : attempts) {
+		if (std::find(tried.begin(), tried.end(), opts) != tried.end())
+			continue;
+		tried.push_back(opts);
+		if (mount(Actual_Block_Device.c_str(), Mount_Point.c_str(), mount_fs.c_str(), flags,
+				opts.empty() ? NULL : opts.c_str()) == 0) {
+			if (opts != options)
+				LOGINFO("Mounted '%s' with reduced options '%s' (requested '%s')\n", Mount_Point.c_str(), opts.c_str(), options.c_str());
+			else if (opts != Mount_Options)
+				LOGINFO("Mounted '%s' with options '%s'\n", Mount_Point.c_str(), opts.c_str());
+			if (Mount_Point == "/data" && Needs_Inline_Crypt && !Has_Mount_Option(opts, "inlinecrypt"))
+				LOGINFO("WARNING: '%s' mounted without 'inlinecrypt'; ICE-based FBE keys may be unusable on this kernel\n", Mount_Point.c_str());
+			return 0;
+		}
+		LOGINFO("mount '%s' on '%s' (%s) with options '%s' failed: %s\n", Actual_Block_Device.c_str(),
+			Mount_Point.c_str(), mount_fs.c_str(), opts.c_str(), strerror(errno));
+	}
+	return -1;
+}
+
 bool TWPartition::Mount(bool Display_Error) {
 	int exfat_mounted = 0;
 	unsigned int flags = Mount_Flags;
@@ -1688,9 +1759,7 @@ bool TWPartition::Mount(bool Display_Error) {
 	if (Current_File_System == "exfat" && TWFunc::Path_Exists("/sys/module/texfat"))
 		mount_fs = "texfat";
 
-	if (!exfat_mounted &&
-		mount(Actual_Block_Device.c_str(), Mount_Point.c_str(), mount_fs.c_str(), flags, Mount_Options.c_str()) != 0 &&
-		mount(Actual_Block_Device.c_str(), Mount_Point.c_str(), mount_fs.c_str(), flags, NULL) != 0) {
+	if (!exfat_mounted && Mount_With_Fallback(mount_fs, flags) != 0) {
 #ifdef TW_NO_EXFAT_FUSE
 		if (Current_File_System == "exfat") {
 			LOGINFO("Mounting exfat failed, trying vfat...\n");

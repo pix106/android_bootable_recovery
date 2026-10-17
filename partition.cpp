@@ -1658,6 +1658,20 @@ bool TWPartition::Mount(bool Display_Error) {
 	int exfat_mounted = 0;
 	unsigned int flags = Mount_Flags;
 
+	if (Mount_Point == "/persist") {
+		struct stat st, parent;
+		if (stat("/mnt/vendor/persist/.", &st) == 0 &&
+			stat("/mnt/vendor/.", &parent) == 0 &&
+			st.st_dev != parent.st_dev) {
+			if (mount("/mnt/vendor/persist", Mount_Point.c_str(), "", MS_BIND, NULL) == 0) {
+				LOGINFO("Bind-mounted '/mnt/vendor/persist' on '/persist'\n");
+				return true;
+			}
+			LOGINFO("Failed to bind-mount '/mnt/vendor/persist' on '/persist': %s\n", strerror(errno));
+			return false;
+		}
+	}
+
 	if (Is_Mounted()) {
 		return true;
 	} else if (!Can_Be_Mounted) {
